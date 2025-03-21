@@ -152,7 +152,8 @@ def build_merged_ui():
                         rms_mix_rate0,
                         protect0,
                     ],
-                    outputs=[vc_output1, vc_output2]
+                    outputs=[vc_output1, vc_output2],
+                    stream=True  # Enable streaming so Gradio iterates over your generator
                 )
                 
                 # Connect modified_get_vc function for dropdown change
