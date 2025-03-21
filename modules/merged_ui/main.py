@@ -1,7 +1,7 @@
 import gradio as gr
 
 # Import modules from your packages
-from merged_ui.utils import async_generate_and_process_with_rvc, modified_get_vc
+from merged_ui.utils import generate_and_process_with_rvc, modified_get_vc
 from rvc_ui.initialization import config
 from rvc_ui.main import names, index_paths
 
@@ -135,7 +135,7 @@ def build_merged_ui():
                 
                 # Connect generate function to button with streaming enabled
                 generate_with_rvc_button.click(
-                    async_generate_and_process_with_rvc,
+                    generate_and_process_with_rvc,
                     inputs=[
                         tts_text_input,
                         prompt_text_input,
