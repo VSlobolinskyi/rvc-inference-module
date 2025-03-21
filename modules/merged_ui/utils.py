@@ -1,5 +1,7 @@
 import asyncio
 import datetime
+import queue
+import threading
 import time
 import logging
 import os
@@ -226,34 +228,47 @@ def modified_get_vc(sid0_value, protect0_value, file_index2_component):
     
     return 0, protect0_value, file_index2_component.choices[0] if file_index2_component.choices else ""
 
-async def async_generate_and_process_with_rvc(
+def generate_and_process_with_rvc(
     text, prompt_text, prompt_wav_upload, prompt_wav_record,
     spk_item, vc_transform, f0method, 
     file_index1, file_index2, index_rate, filter_radius,
     resample_sr, rms_mix_rate, protect
 ):
     """
-    Asynchronous pipeline for TTS+RVC conversion.
+    Generator that uses threading to run two Spark models and one RVC model concurrently.
+    Each Spark model (loaded once in GPU memory) pulls sentences from a shared queue and saves
+    its TTS output to disk. The RVC worker pulls TTS outputs, runs voice conversion, and yields
+    the resulting RVC file path to the Gradio UI.
     
-    - Two Spark workers grab sentences from the sentence_queue,
-      run TTS inference in parallel (using asyncio.to_thread), and
-      save outputs in ./TEMP/spark.
-    - A single RVC worker awaits TTS outputs from rvc_queue, converts them,
-      saves the RVC output in ./TEMP/rvc, and yields the rvc_path to Gradio.
-    - Before yielding a new output, the RVC worker waits for the previous
-      audio's duration to pass.
+    Before yielding a new output, the function waits for the previous audio’s duration (simulated
+    playback) to finish.
     """
-    # Ensure TEMP directories exist
+    # --- Model Loading (only once on GPU) ---
+    from spark.cli.SparkTTS import SparkTTS
+    from rvc_ui.initialization import vc  # assume vc is a callable/instance for RVC inference
+    import torch
+
+    model_dir = "spark/pretrained_models/Spark-TTS-0.5B"
+    if torch.cuda.is_available():
+        device = torch.device("cuda:0")
+    else:
+        device = torch.device("cpu")
+    # Load two Spark models:
+    spark_model1 = SparkTTS(model_dir, device)
+    spark_model2 = SparkTTS(model_dir, device)
+    # Load the RVC model (assumed to be pre-initialized in vc)
+    rvc_model = vc
+
+    # --- Setup Directories and Input ---
     os.makedirs("./TEMP/spark", exist_ok=True)
     os.makedirs("./TEMP/rvc", exist_ok=True)
     
-    # Split text into sentences
     sentences = split_into_sentences(text)
     if not sentences:
         yield "No valid text to process.", None
         return
 
-    # Determine base_fragment_num to avoid filename collisions
+    # To avoid filename collisions
     base_fragment_num = 1
     while any(
         os.path.exists(f"./TEMP/spark/fragment_{base_fragment_num + i}.wav") or 
@@ -262,67 +277,50 @@ async def async_generate_and_process_with_rvc(
     ):
         base_fragment_num += 1
 
-    # Process reference speech and prompt text
     prompt_speech = prompt_wav_upload if prompt_wav_upload else prompt_wav_record
     prompt_text_clean = None if not prompt_text or len(prompt_text) < 2 else prompt_text
 
-    info_messages = [f"Processing {len(sentences)} sentences asynchronously..."]
+    info_messages = [f"Processing {len(sentences)} sentences concurrently..."]
 
-    # Create asyncio queues:
-    sentence_queue = asyncio.Queue()
-    rvc_queue = asyncio.Queue()
-    yield_queue = asyncio.Queue()
+    # --- Create Queues ---
+    sentence_queue = queue.Queue()
+    tts_queue = queue.Queue()
+    rvc_queue = queue.Queue()
 
-    # Enqueue each sentence with its index
+    # Enqueue sentences (with index)
     for i, sentence in enumerate(sentences):
-        await sentence_queue.put((i, sentence))
+        sentence_queue.put((i, sentence))
 
-    # Define the Spark worker (each one runs in parallel)
-    async def spark_worker(worker_id):
-        while not sentence_queue.empty():
-            try:
-                i, sentence = await sentence_queue.get()
-            except asyncio.CancelledError:
-                break
-            # Run TTS inference in a separate thread
-            tts_path = await asyncio.to_thread(
-                run_tts,
-                sentence,
-                prompt_text_clean,
-                prompt_speech,
-                "TEMP/spark",
-                f"fragment_{base_fragment_num}_{worker_id}_{i}.wav"
-            )
-            # Put the result into the RVC queue for further processing
-            await rvc_queue.put((i, sentence, tts_path))
-            sentence_queue.task_done()
+    # --- Define Worker Functions ---
 
-    # Define the RVC worker
-    async def rvc_worker():
-        # Use the event loop time to enforce a waiting period
-        next_available_time = asyncio.get_event_loop().time()
+    # Spark worker: uses a given Spark model instance to process sentences.
+    def spark_worker(worker_id, spark_model):
         while True:
             try:
-                i, sentence, tts_path = await rvc_queue.get()
-            except asyncio.CancelledError:
+                i, sentence = sentence_queue.get_nowait()
+            except queue.Empty:
                 break
-            # Run RVC conversion in a separate thread
-            output_info, output_audio = await asyncio.to_thread(
-                vc.vc_single,
-                spk_item,
-                tts_path,
-                vc_transform,
-                None,            # No f0_file
-                f0method,
-                file_index1,
-                file_index2,
-                index_rate,
-                filter_radius,
-                resample_sr,
-                rms_mix_rate,
-                protect
+            filename = f"fragment_{base_fragment_num}_{worker_id}_{i}.wav"
+            save_dir = "./TEMP/spark"
+            # Run TTS inference (this call is blocking, but runs in this dedicated thread)
+            tts_path = run_tts(spark_model, sentence, prompt_text_clean, prompt_speech, save_dir, filename)
+            tts_queue.put((i, sentence, tts_path))
+            sentence_queue.task_done()
+
+    # RVC worker: processes TTS outputs using the loaded RVC model.
+    def rvc_worker():
+        while True:
+            try:
+                i, sentence, tts_path = tts_queue.get(timeout=5)
+            except queue.Empty:
+                break
+            # Run RVC inference (blocking call)
+            output_info, output_audio = vc.vc_single(
+                rvc_model, tts_path, spk_item, vc_transform, f0method,
+                file_index1, file_index2, index_rate, filter_radius,
+                resample_sr, rms_mix_rate, protect
             )
-            # Save the RVC output to file
+            # Save RVC output file
             rvc_output_path = f"./TEMP/rvc/fragment_{base_fragment_num}_{i}.wav"
             rvc_saved = False
             try:
@@ -330,57 +328,55 @@ async def async_generate_and_process_with_rvc(
                     shutil.copy2(output_audio, rvc_output_path)
                     rvc_saved = True
                 elif isinstance(output_audio, tuple) and len(output_audio) >= 2:
-                    try:
-                        sf.write(rvc_output_path, output_audio[1], output_audio[0])
-                        rvc_saved = True
-                    except Exception as inner_e:
-                        output_info += f"\nFailed to save RVC tuple format: {str(inner_e)}"
+                    sf.write(rvc_output_path, output_audio[1], output_audio[0])
+                    rvc_saved = True
                 elif hasattr(output_audio, 'name') and os.path.exists(output_audio.name):
                     shutil.copy2(output_audio.name, rvc_output_path)
                     rvc_saved = True
             except Exception as e:
                 output_info += f"\nError saving RVC output: {str(e)}"
 
-            # Build an info message for this sentence
-            info_message = f"Sentence {i+1}: {sentence[:30]}{'...' if len(sentence) > 30 else ''}\n"
+            info_message = f"Sentence {i+1}: {sentence[:30]}{'...' if len(sentence)>30 else ''}\n"
             info_message += f"  - Spark output: {tts_path}\n"
             if rvc_saved:
                 info_message += f"  - RVC output: {rvc_output_path}"
             else:
                 info_message += f"  - Could not save RVC output to {rvc_output_path}"
+            rvc_queue.put((info_message, rvc_output_path))
+            tts_queue.task_done()
 
-            # Determine duration of the RVC audio (to simulate playback)
-            try:
-                audio_seg = AudioSegment.from_file(rvc_output_path)
-                duration = audio_seg.duration_seconds
-            except Exception:
-                duration = 0
-            current_time = asyncio.get_event_loop().time()
-            if current_time < next_available_time:
-                await asyncio.sleep(next_available_time - current_time)
-            next_available_time = asyncio.get_event_loop().time() + duration
+    # --- Start Worker Threads ---
+    spark_thread1 = threading.Thread(target=spark_worker, args=(1, spark_model1))
+    spark_thread2 = threading.Thread(target=spark_worker, args=(2, spark_model2))
+    spark_thread1.start()
+    spark_thread2.start()
 
-            # Put this update into the yield_queue
-            await yield_queue.put((info_message, rvc_output_path))
-            rvc_queue.task_done()
+    rvc_thread = threading.Thread(target=rvc_worker)
+    rvc_thread.start()
 
-    # Start two Spark workers
-    spark_tasks = [asyncio.create_task(spark_worker(worker_id)) for worker_id in range(2)]
-    # Start one RVC worker
-    rvc_task = asyncio.create_task(rvc_worker())
+    # Wait for Spark and TTS processing to complete.
+    spark_thread1.join()
+    spark_thread2.join()
+    tts_queue.join()
+    rvc_thread.join()
 
-    # Wait until all sentences have been processed by Spark...
-    await sentence_queue.join()
-    # ...and then until all TTS outputs have been processed by RVC
-    await rvc_queue.join()
-
-    # Drain yield_queue and yield updates to Gradio.
-    while not yield_queue.empty():
-        info_message, rvc_path = yield_queue.get_nowait()
+    # --- Yield Results with Playback Timing ---
+    next_available_time = time.time()
+    while not rvc_queue.empty():
+        info_message, rvc_path = rvc_queue.get()
+        try:
+            audio_seg = AudioSegment.from_file(rvc_path)
+            duration = audio_seg.duration_seconds
+        except Exception:
+            duration = 0
+        cur_time = time.time()
+        if cur_time < next_available_time:
+            time.sleep(next_available_time - cur_time)
+        next_available_time = time.time() + duration
         info_messages.append(info_message)
         yield "\n".join(info_messages), rvc_path
 
-    # Cancel any remaining tasks (if any)
-    for task in spark_tasks:
-        task.cancel()
-    rvc_task.cancel()
+    # Final yield (if needed)
+    if not rvc_queue.empty():
+        _, final_path = rvc_queue.get()
+        yield "\n".join(info_messages), final_path
