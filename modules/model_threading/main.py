@@ -1,7 +1,4 @@
-# Add to merged_ui/utils.py or create a new file
-
 import os
-import re
 import time
 import threading
 import queue
@@ -11,7 +8,7 @@ import torch
 from pydub import AudioSegment
 import soundfile as sf
 import shutil
-
+from merged_ui.utils import split_into_sentences
 from spark.cli.SparkTTS import SparkTTS
 from rvc_ui.initialization import vc
 
@@ -20,17 +17,6 @@ spark_models = []
 model_dir = "spark/pretrained_models/Spark-TTS-0.5B"
 device = 0
 
-def modified_get_vc(sid0_value, protect0_value, file_index2_component):
-    """
-    Modified function to get voice conversion parameters
-    """
-    protect1_value = protect0_value
-    outputs = vc.get_vc(sid0_value, protect0_value, protect1_value)
-    
-    if isinstance(outputs, tuple) and len(outputs) >= 3:
-        return outputs[0], outputs[1], outputs[3]
-    
-    return 0, protect0_value, file_index2_component.choices[0] if file_index2_component.choices else ""
 
 def split_into_sentences(text):
     """
@@ -52,11 +38,6 @@ def initialize_spark_models(num_models=2):
     """Initialize multiple Spark models and keep them in GPU memory"""
     global spark_models
     
-    
-    # Only initialize if not already initialized
-    if len(spark_models) == num_models:
-        return spark_models
-        
     # Clear any existing models
     spark_models = []
     
@@ -122,7 +103,7 @@ def run_tts_with_model(
     logging.info(f"TTS audio saved at: {save_path}")
     return save_path
 
-def _async_generate_and_process_with_rvc(
+def async_generate_and_process_with_rvc(
     text, prompt_text, prompt_wav_upload, prompt_wav_record,
     spk_item, vc_transform, f0method, 
     file_index1, file_index2, index_rate, filter_radius,
@@ -145,6 +126,7 @@ def _async_generate_and_process_with_rvc(
     os.makedirs("./TEMP/spark", exist_ok=True)
     os.makedirs("./TEMP/rvc", exist_ok=True)
     
+    # Split text into sentences
     sentences = split_into_sentences(text)
     if not sentences:
         yield "No valid text to process.", None
@@ -405,29 +387,29 @@ def _async_generate_and_process_with_rvc(
         if final_path:
             yield "\n".join(info_messages), final_path
 
-
-# This is the wrapper function that maintains the same interface as your original function
-def generate_and_process_with_rvc(
-    text, prompt_text, prompt_wav_upload, prompt_wav_record,
-    spk_item, vc_transform, f0method, 
-    file_index1, file_index2, index_rate, filter_radius,
-    resample_sr, rms_mix_rate, protect
-):
-    """
-    Wrapper around the asynchronous implementation that maintains the same interface.
+# Usage example:
+if __name__ == "__main__":
+    # Initialize models on startup (optional)
+    initialize_spark_models(2)
     
-    Returns:
-        A generator that yields tuples of (info_message, audio_path) exactly as expected by Gradio.
-    """
-    # In Gradio, when a function is a generator, each yielded value must match the outputs format
-    generator = _async_generate_and_process_with_rvc(
-        text, prompt_text, prompt_wav_upload, prompt_wav_record,
-        spk_item, vc_transform, f0method, 
-        file_index1, file_index2, index_rate, filter_radius,
-        resample_sr, rms_mix_rate, protect,
-        num_spark_models=2  # Use 2 Spark models as requested
-    )
-    
-    # Simply pass through the yielded values
-    for info, path in generator:
-        yield info, path
+    # Example parameters
+    for info, audio_path in async_generate_and_process_with_rvc(
+        text="This is a test of the asynchronous TTS and RVC system.",
+        prompt_text=None,
+        prompt_wav_upload=None,
+        prompt_wav_record=None,
+        spk_item=0,
+        vc_transform=0,
+        f0method="rmvpe",
+        file_index1="models/index/my_index.index",
+        file_index2="",
+        index_rate=0.75,
+        filter_radius=3,
+        resample_sr=44100,
+        rms_mix_rate=0.25, 
+        protect=0.33,
+        num_spark_models=2
+    ):
+        print(info)
+        if audio_path:
+            print(f"New audio available: {audio_path}")

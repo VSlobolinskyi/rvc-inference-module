@@ -20,6 +20,10 @@ from = "modules"
 include = "merged_ui"
 from = "modules"
 
+[[tool.poetry.packages]]
+include = "model_threading"
+from = "modules"
+
 [tool.poetry.dependencies]
 python = ">=3.11,<3.12"
 # ---------------------------------------------------------------------------
