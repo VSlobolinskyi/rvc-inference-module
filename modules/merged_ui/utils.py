@@ -1,6 +1,7 @@
 # Add to merged_ui/utils.py or create a new file
 
 import os
+import re
 import time
 import threading
 import queue
@@ -11,15 +12,46 @@ from pydub import AudioSegment
 import soundfile as sf
 import shutil
 
+from spark.cli.SparkTTS import SparkTTS
+from rvc_ui.initialization import vc
+
 # Global models - initialize once and reuse
 spark_models = []
 model_dir = "spark/pretrained_models/Spark-TTS-0.5B"
 device = 0
 
+def modified_get_vc(sid0_value, protect0_value, file_index2_component):
+    """
+    Modified function to get voice conversion parameters
+    """
+    protect1_value = protect0_value
+    outputs = vc.get_vc(sid0_value, protect0_value, protect1_value)
+    
+    if isinstance(outputs, tuple) and len(outputs) >= 3:
+        return outputs[0], outputs[1], outputs[3]
+    
+    return 0, protect0_value, file_index2_component.choices[0] if file_index2_component.choices else ""
+
+def split_into_sentences(text):
+    """
+    Split text into sentences using regular expressions.
+    
+    Args:
+        text (str): The input text to split
+        
+    Returns:
+        list: A list of sentences
+    """
+    # Split on period, exclamation mark, or question mark followed by space or end of string
+    sentences = re.split(r'(?<=[.!?])\s+|(?<=[.!?])$', text)
+    # Remove any empty sentences
+    sentences = [s.strip() for s in sentences if s.strip()]
+    return sentences
+
 def initialize_spark_models(num_models=2):
     """Initialize multiple Spark models and keep them in GPU memory"""
     global spark_models
-    from spark.cli.SparkTTS import SparkTTS
+    
     
     # Only initialize if not already initialized
     if len(spark_models) == num_models:
@@ -108,15 +140,11 @@ def _async_generate_and_process_with_rvc(
     Yields:
         tuple: (info_message, audio_path) - The info message and path to the latest processed audio
     """
-    from rvc_ui.initialization import vc
-    from spark.cli.SparkTTS import SparkTTS
     
     # Ensure TEMP directories exist
     os.makedirs("./TEMP/spark", exist_ok=True)
     os.makedirs("./TEMP/rvc", exist_ok=True)
     
-    # Split text into sentences
-    from merged_ui.utils import split_into_sentences  # Import your existing function
     sentences = split_into_sentences(text)
     if not sentences:
         yield "No valid text to process.", None
