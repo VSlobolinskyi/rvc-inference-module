@@ -50,25 +50,6 @@ def create_sentence_batches(sentences, num_tts_workers):
     
     return batches
 
-# Helper function to get results in the correct order
-def get_ordered_results(rvc_results_queue, num_sentences):
-    """
-    Retrieves results from the results queue in the correct order.
-    """
-    results = []
-    
-    # Get all results from the queue
-    while not rvc_results_queue.empty():
-        try:
-            priority, item = rvc_results_queue.get_nowait()
-            results.append(item)
-        except Empty:
-            break
-    
-    # Sort results by sentence index
-    results.sort(key=lambda x: x[0])
-    return results
-
 def tts_worker(worker_id, sentences_batch, global_indices, cuda_stream, base_fragment_num,
                prompt_speech, prompt_text_clean, tts_to_rvc_queue, tts_complete_events,
                num_rvc_workers, model_dir, device):
@@ -199,12 +180,13 @@ def rvc_worker(worker_id, cuda_stream, tts_to_rvc_queue, rvc_results_queue,
             # Check if the item indicates an error from a TTS worker (length==5)
             if len(item) == 5:
                 i, fragment_num, sentence, _, error = item
-                rvc_results_queue.put((i, (i, None, None, False, f"TTS error for sentence {i+1}: {error}")))
+                # Don't nest the tuple again - just add the priority directly
+                rvc_results_queue.put((i, i, None, None, False, f"TTS error for sentence {i+1}: {error}"))
                 continue
             
             i, fragment_num, sentence, tts_path = item
             if not tts_path or not os.path.exists(tts_path):
-                rvc_results_queue.put((i, (i, None, None, False, f"No TTS output for sentence {i+1}")))
+                rvc_results_queue.put((i, i, None, None, False, f"No TTS output for sentence {i+1}"))
                 continue
             
             # Determine output file path
@@ -250,14 +232,14 @@ def rvc_worker(worker_id, cuda_stream, tts_to_rvc_queue, rvc_results_queue,
                 else:
                     info_message += f"  - Could not save RVC output to {rvc_path}"
                 
-                # Add to results queue with original index as priority
-                rvc_results_queue.put((i, (i, tts_path, rvc_path if rvc_saved else None, rvc_saved, info_message)))
+                # Add to results queue - first element is priority, then actual data fields
+                rvc_results_queue.put((i, i, tts_path, rvc_path if rvc_saved else None, rvc_saved, info_message))
             except Exception as e:
                 logging.error(f"RVC Worker {worker_id} error for sentence {i+1}: {str(e)}")
                 info_message = f"Sentence {i+1}: {sentence[:30]}{'...' if len(sentence) > 30 else ''}\n"
                 info_message += f"  - Spark output: {tts_path}\n"
                 info_message += f"  - RVC processing error (Worker {worker_id}): {str(e)}"
-                rvc_results_queue.put((i, (i, tts_path, None, False, info_message)))
+                rvc_results_queue.put((i, i, tts_path, None, False, info_message))
         
         except Empty:
             if all(event.is_set() for event in tts_complete_events):
@@ -269,3 +251,29 @@ def rvc_worker(worker_id, cuda_stream, tts_to_rvc_queue, rvc_results_queue,
     
     if all(event.is_set() for event in rvc_complete_events):
         processing_complete.set()
+
+# Helper function to get results in the correct order
+def get_ordered_results(rvc_results_queue, num_sentences):
+    """
+    Retrieves results from the results queue in the correct order.
+    The queue now returns tuples where the first element is the priority,
+    followed by all the data fields directly - no nested tuples.
+    """
+    results = []
+    
+    # Get all results from the queue
+    while not rvc_results_queue.empty():
+        try:
+            # The queue now contains (priority, i, tts_path, rvc_path, rvc_saved, info_message)
+            # The first element is the priority, which we don't need in the results
+            priority_tuple = rvc_results_queue.get_nowait()
+            
+            # Extract everything except the first priority value
+            result_tuple = priority_tuple[1:]  # Skip the priority
+            results.append(result_tuple)
+        except Empty:
+            break
+    
+    # Sort results by sentence index (first element of each tuple)
+    results.sort(key=lambda x: x[0])
+    return results
