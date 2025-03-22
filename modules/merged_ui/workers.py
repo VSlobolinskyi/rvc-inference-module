@@ -12,15 +12,15 @@ from spark.cli.SparkTTS import SparkTTS
 from rvc_ui.initialization import vc
 
 # Global shared sentence queue
-distributed_sentence_queue = Queue()
+distributed_sentence_queue = PriorityQueue()  # Changed to PriorityQueue to ensure order
 
 def create_queues_and_events(num_tts_workers, num_rvc_workers):
     """
     Create queues and events for inter-thread communication.
     Using PriorityQueue for tts_to_rvc_queue to prioritize by fragment number.
     """
-    tts_to_rvc_queue = PriorityQueue()  # Changed to PriorityQueue to prioritize lower fragment numbers
-    rvc_results_queue = Queue()
+    tts_to_rvc_queue = PriorityQueue()  # Priority by fragment number
+    rvc_results_queue = PriorityQueue()  # Changed to PriorityQueue to maintain order in results
     tts_complete_events = [threading.Event() for _ in range(num_tts_workers)]
     rvc_complete_events = [threading.Event() for _ in range(num_rvc_workers)]
     processing_complete = threading.Event()
@@ -29,7 +29,7 @@ def create_queues_and_events(num_tts_workers, num_rvc_workers):
 def create_sentence_batches(sentences, num_tts_workers):
     """
     Create batches that distribute work across TTS workers.
-    Modified to use a shared queue approach so workers grab sentences in order.
+    Modified to use a shared priority queue to strictly maintain order.
     """
     global distributed_sentence_queue
     
@@ -40,9 +40,9 @@ def create_sentence_batches(sentences, num_tts_workers):
         except Empty:
             break
     
-    # Add all sentences to the queue
+    # Add all sentences to the queue with their original index as priority
     for idx, sentence in enumerate(sentences):
-        distributed_sentence_queue.put((sentence, idx))
+        distributed_sentence_queue.put((idx, (sentence, idx)))  # Use index as priority
     
     # Return empty batches for all workers
     # They will pull from the shared queue
@@ -50,12 +50,31 @@ def create_sentence_batches(sentences, num_tts_workers):
     
     return batches
 
+# Helper function to get results in the correct order
+def get_ordered_results(rvc_results_queue, num_sentences):
+    """
+    Retrieves results from the results queue in the correct order.
+    """
+    results = []
+    
+    # Get all results from the queue
+    while not rvc_results_queue.empty():
+        try:
+            priority, item = rvc_results_queue.get_nowait()
+            results.append(item)
+        except Empty:
+            break
+    
+    # Sort results by sentence index
+    results.sort(key=lambda x: x[0])
+    return results
+
 def tts_worker(worker_id, sentences_batch, global_indices, cuda_stream, base_fragment_num,
                prompt_speech, prompt_text_clean, tts_to_rvc_queue, tts_complete_events,
                num_rvc_workers, model_dir, device):
     """
     TTS worker thread that processes sentences and adds results to the RVC queue.
-    Modified to pull from a shared queue and prioritize fragments by number.
+    Modified to pull from a shared priority queue and maintain strict order.
     """
     global distributed_sentence_queue
     
@@ -76,12 +95,13 @@ def tts_worker(worker_id, sentences_batch, global_indices, cuda_stream, base_fra
         processed_count = 0
         while True:
             try:
-                # Get next sentence from the queue
-                sentence_data = distributed_sentence_queue.get(block=False)
-                if sentence_data is None:
+                # Get next sentence from the queue - will get lowest index first
+                priority_data = distributed_sentence_queue.get(block=False)
+                if priority_data is None:
                     break
                 
-                sentence, global_idx = sentence_data
+                # Extract the sentence and global_idx from the priority tuple
+                _, (sentence, global_idx) = priority_data
                 processed_count += 1
                 
                 # Process sentence
@@ -90,7 +110,7 @@ def tts_worker(worker_id, sentences_batch, global_indices, cuda_stream, base_fra
                 save_path = os.path.join("./TEMP/spark", tts_filename)
                 
                 try:
-                    logging.info(f"TTS Worker {worker_id}: Processing text: {sentence[:30]}...")
+                    logging.info(f"TTS Worker {worker_id}: Processing text {global_idx+1}: {sentence[:30]}...")
                     stream_ctx = torch.cuda.stream(cuda_stream) if cuda_stream and torch.cuda.is_available() else nullcontext()
                     with stream_ctx:
                         with torch.no_grad():
@@ -106,11 +126,11 @@ def tts_worker(worker_id, sentences_batch, global_indices, cuda_stream, base_fra
                     logging.info(f"TTS Worker {worker_id}: Audio saved at: {save_path}")
                     
                     # Put in priority queue with fragment number as priority
-                    tts_to_rvc_queue.put((fragment_num, (global_idx, fragment_num, sentence, save_path)))
+                    tts_to_rvc_queue.put((global_idx, (global_idx, fragment_num, sentence, save_path)))
                     
                 except Exception as e:
-                    logging.error(f"TTS Worker {worker_id} error for sentence {global_idx}: {str(e)}")
-                    tts_to_rvc_queue.put((fragment_num, (global_idx, fragment_num, sentence, None, str(e))))
+                    logging.error(f"TTS Worker {worker_id} error for sentence {global_idx+1}: {str(e)}")
+                    tts_to_rvc_queue.put((global_idx, (global_idx, fragment_num, sentence, None, str(e))))
                 
             except Empty:
                 break
@@ -124,7 +144,7 @@ def tts_worker(worker_id, sentences_batch, global_indices, cuda_stream, base_fra
             save_path = os.path.join("./TEMP/spark", tts_filename)
             
             try:
-                logging.info(f"TTS Worker {worker_id}: Processing text: {sentence[:30]}...")
+                logging.info(f"TTS Worker {worker_id}: Processing text {global_idx+1}: {sentence[:30]}...")
                 stream_ctx = torch.cuda.stream(cuda_stream) if cuda_stream and torch.cuda.is_available() else nullcontext()
                 with stream_ctx:
                     with torch.no_grad():
@@ -139,12 +159,12 @@ def tts_worker(worker_id, sentences_batch, global_indices, cuda_stream, base_fra
                 sf.write(save_path, wav, samplerate=16000)
                 logging.info(f"TTS Worker {worker_id}: Audio saved at: {save_path}")
                 
-                # Put in priority queue with fragment number as priority
-                tts_to_rvc_queue.put((fragment_num, (global_idx, fragment_num, sentence, save_path)))
+                # Put in priority queue with original index as priority to maintain strict order
+                tts_to_rvc_queue.put((global_idx, (global_idx, fragment_num, sentence, save_path)))
                 
             except Exception as e:
-                logging.error(f"TTS Worker {worker_id} error for sentence {global_idx}: {str(e)}")
-                tts_to_rvc_queue.put((fragment_num, (global_idx, fragment_num, sentence, None, str(e))))
+                logging.error(f"TTS Worker {worker_id} error for sentence {global_idx+1}: {str(e)}")
+                tts_to_rvc_queue.put((global_idx, (global_idx, fragment_num, sentence, None, str(e))))
     
     logging.info(f"TTS Worker {worker_id}: Completed processing sentences")
     tts_complete_events[worker_id].set()
@@ -160,13 +180,13 @@ def rvc_worker(worker_id, cuda_stream, tts_to_rvc_queue, rvc_results_queue,
                resample_sr, rms_mix_rate, protect, processing_complete):
     """
     RVC worker thread that processes TTS outputs.
-    Modified to handle priority queue items, prioritizing lower fragment numbers.
+    Modified to handle priority queue items and maintain original sentence order.
     """
     logging.info(f"RVC Worker {worker_id}: Starting")
     
     while True:
         try:
-            # Get item from priority queue (will prioritize lower fragment numbers)
+            # Get item from priority queue (will prioritize lower indices)
             priority_item = tts_to_rvc_queue.get(timeout=0.5)
             
             # Extract actual item from priority tuple
@@ -174,24 +194,24 @@ def rvc_worker(worker_id, cuda_stream, tts_to_rvc_queue, rvc_results_queue,
             if priority_item[1] is None:
                 break
                 
-            _, item = priority_item
+            original_idx, item = priority_item
             
             # Check if the item indicates an error from a TTS worker (length==5)
             if len(item) == 5:
                 i, fragment_num, sentence, _, error = item
-                rvc_results_queue.put((i, None, None, False, f"TTS error for sentence {i+1}: {error}"))
+                rvc_results_queue.put((i, (i, None, None, False, f"TTS error for sentence {i+1}: {error}")))
                 continue
             
             i, fragment_num, sentence, tts_path = item
             if not tts_path or not os.path.exists(tts_path):
-                rvc_results_queue.put((i, None, None, False, f"No TTS output for sentence {i+1}"))
+                rvc_results_queue.put((i, (i, None, None, False, f"No TTS output for sentence {i+1}")))
                 continue
             
             # Determine output file path
             rvc_path = os.path.join("./TEMP/rvc", f"fragment_{fragment_num}.wav")
             
             try:
-                logging.info(f"RVC Worker {worker_id}: Processing fragment {fragment_num}")
+                logging.info(f"RVC Worker {worker_id}: Processing fragment {fragment_num} (sentence {i+1})")
                 
                 # Merged process_with_rvc logic
                 with (torch.cuda.stream(cuda_stream) if cuda_stream and torch.cuda.is_available() else nullcontext()):
@@ -230,13 +250,14 @@ def rvc_worker(worker_id, cuda_stream, tts_to_rvc_queue, rvc_results_queue,
                 else:
                     info_message += f"  - Could not save RVC output to {rvc_path}"
                 
-                rvc_results_queue.put((i, tts_path, rvc_path if rvc_saved else None, rvc_saved, info_message))
+                # Add to results queue with original index as priority
+                rvc_results_queue.put((i, (i, tts_path, rvc_path if rvc_saved else None, rvc_saved, info_message)))
             except Exception as e:
-                logging.error(f"RVC Worker {worker_id} error for sentence {i}: {str(e)}")
+                logging.error(f"RVC Worker {worker_id} error for sentence {i+1}: {str(e)}")
                 info_message = f"Sentence {i+1}: {sentence[:30]}{'...' if len(sentence) > 30 else ''}\n"
                 info_message += f"  - Spark output: {tts_path}\n"
                 info_message += f"  - RVC processing error (Worker {worker_id}): {str(e)}"
-                rvc_results_queue.put((i, tts_path, None, False, info_message))
+                rvc_results_queue.put((i, (i, tts_path, None, False, info_message)))
         
         except Empty:
             if all(event.is_set() for event in tts_complete_events):
