@@ -2,8 +2,8 @@ import time
 import logging
 import os
 import threading
-from merged_ui.utils import create_queues_and_events, create_sentence_batches, get_base_fragment_num, initialize_cuda_streams, initialize_temp_dirs, prepare_audio_buffer, prepare_prompt, split_text_and_validate
-from merged_ui.workers import rvc_worker, tts_worker
+from merged_ui.utils import create_sentence_batches, get_base_fragment_num, initialize_cuda_streams, initialize_temp_dirs, prepare_audio_buffer, prepare_prompt, split_text_and_validate
+from merged_ui.workers import create_queues_and_events, rvc_worker, tts_worker
 
 def process_results(sentences, rvc_results_queue, buffer, processing_complete):
     """

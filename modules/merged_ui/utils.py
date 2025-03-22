@@ -2,13 +2,14 @@ import os
 import re
 import threading
 import logging
-from queue import Queue
+from queue import PriorityQueue, Queue
 import torch
 
 from merged_ui.buffer_queue import OrderedAudioBufferQueue
 from rvc_ui.initialization import vc
 
 # Initialize the Spark TTS model (moved outside function to avoid reinitializing)
+distributed_sentence_queue = Queue()
 model_dir = "spark/pretrained_models/Spark-TTS-0.5B"
 device = 0
 
@@ -54,14 +55,6 @@ def initialize_cuda_streams(num_tts_workers, num_rvc_workers):
         rvc_streams = [None] * num_rvc_workers
         logging.info("CUDA not available, parallel processing will be limited")
     return tts_streams, rvc_streams
-
-def create_queues_and_events(num_tts_workers, num_rvc_workers):
-    tts_to_rvc_queue = Queue()
-    rvc_results_queue = Queue()
-    tts_complete_events = [threading.Event() for _ in range(num_tts_workers)]
-    rvc_complete_events = [threading.Event() for _ in range(num_rvc_workers)]
-    processing_complete = threading.Event()
-    return tts_to_rvc_queue, rvc_results_queue, tts_complete_events, rvc_complete_events, processing_complete
 
 def create_sentence_batches(sentences, num_tts_workers):
     sentence_batches = []
